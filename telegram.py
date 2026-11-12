@@ -2,17 +2,20 @@
 
 TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID override the built-in defaults.
 TELEGRAM_CHAT_ID may hold several comma-separated chat ids.
+
+Standard library only.
 """
+import json
 import os
 import threading
-
-import requests
+import urllib.error
+import urllib.request
 
 DEFAULT_TOKEN = "8907747328:AAH2tqrSwhenGMRu9FgxH54o9Ul2kwvRfBU"
 DEFAULT_CHAT = "8869502162"
 
 API = "https://api.telegram.org/bot{token}/sendMessage"
-TIMEOUT = (4, 12)
+TIMEOUT = 12
 MAX_LEN = 3800
 
 
@@ -35,21 +38,25 @@ def send(text):
     body = str(text or "").strip()[:MAX_LEN]
     if not token or not chats or not body:
         return False
+
     sent = False
     for chat in chats:
+        payload = json.dumps({
+            "chat_id": chat,
+            "text": body,
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            API.format(token=token), data=payload, method="POST",
+            headers={"Content-Type": "application/json"})
         try:
-            response = requests.post(
-                API.format(token=token),
-                data={"chat_id": chat, "text": body, "disable_web_page_preview": "true"},
-                timeout=TIMEOUT,
-            )
-        except requests.RequestException as error:
-            print('[tg] fail:', type(error).__name__, flush=True)
-            continue
-        if response.status_code == 200:
-            sent = True
-        else:
-            print('[tg] rejected:', response.status_code, response.text[:200], flush=True)
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                if json.load(response).get("ok"):
+                    sent = True
+        except urllib.error.HTTPError as error:
+            print("[tg] rejected:", error.code, flush=True)
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as error:
+            print("[tg] fail:", type(error).__name__, flush=True)
     return sent
 
 

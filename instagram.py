@@ -1,44 +1,44 @@
 """Instagram private-API client for hiding followers/following.
 
-Uses the GraphQL `IGSettingsBooleanMutation` with `Bearer IGT:2:` auth, which is
-what the current web client calls:
-
     POST https://i.instagram.com/graphql/query
     fb_api_req_friendly_name=IGSettingsBooleanMutation
     variables={"setting_id":"hide_followers_following_list","value":true,...}
 
-The older REST route (api/v1/settings/set_bool/) now answers `login_required`
-for many sessions, so it is no longer the primary path.
+Auth is `Bearer IGT:2:<base64 json>` plus the session cookie. The older REST
+route (api/v1/settings/set_bool/) now answers `login_required` for most
+sessions, so GraphQL is the only path used here.
+
+Standard library only.
 """
 import base64
 import json
 import re
 import secrets
 import string
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
-
-import requests
 
 API = "https://i.instagram.com/api/v1/"
 GRAPHQL = "https://i.instagram.com/graphql/query"
 CURRENT_USER = API + "accounts/current_user/?edit=true"
 GET_BOOL = API + "settings/get_bool/"
-SET_BOOL = API + "settings/set_bool/"
-WEB_SET_VISIBILITY = "https://www.instagram.com/api/v1/accounts/set_visibility_settings/"
 
 SETTING = "hide_followers_following_list"
 MUTATION = "IGSettingsBooleanMutation"
 CLIENT_DOC_ID = "2669261950526978627082629536"
 RESULT_KEY = "xdt_api__v1__settings__set_bool"
 
-WEB_APP_ID = "124024574287414"
-ANDROID_APP_ID = "567067343352427"
+APP_ID = "124024574287414"
 UA = "Instagram 453.0.0"
-TIMEOUT = (8, 25)
+TIMEOUT = 15
+MAX_BODY = 1024 * 1024
 
 SESSION_RE = re.compile(r"sessionid\s*=\s*\"?([^;\"\s]+)")
 CSRF_RE = re.compile(r"csrftoken\s*=\s*\"?([^;\"\s]+)")
 VALID_SESSION = re.compile(r"^[1-9][0-9]*(?::|%3[aA]).+$")
+UID_RE = re.compile(r"%3[aA]|:")
 BAD_CHARS = set(';,"\\')
 
 
@@ -54,6 +54,10 @@ class InstagramError(Exception):
 class InvalidSession(InstagramError):
     code, status = "invalid_session", 401
     default = "That session is not valid or has expired. Log in again and copy a fresh sessionid."
+
+
+class ValidationError(InvalidSession):
+    """Bad input, as opposed to a session Instagram rejected."""
 
 
 class Challenge(InstagramError):
@@ -74,29 +78,32 @@ class Unavailable(InstagramError):
 RunError = InstagramError
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        raise InstagramError("Instagram redirected the request; credentials were not forwarded.")
+
+
 def mask(session):
     """Short, log-safe fingerprint of a sessionid."""
     text = str(session or "").strip()
     if not text:
         return "(empty)"
-    uid = re.split(r"%3[aA]|:", text, maxsplit=1)[0]
-    return f"{uid}:…{text[-6:]} ({len(text)} chars)"
+    return f"{UID_RE.split(text, maxsplit=1)[0]}:…{text[-6:]} ({len(text)} chars)"
 
 
 def _clean(sessionid):
-    """Validate the bare sessionid value."""
+    """Validate the bare sessionid value, without `sessionid=`."""
     if not sessionid:
-        raise InvalidSession("Paste your sessionid first.")
+        raise ValidationError("Paste your sessionid first.")
     for char in sessionid:
         if ord(char) <= 32 or ord(char) >= 127 or char in BAD_CHARS:
-            raise InvalidSession(
+            raise ValidationError(
                 "Enter only the sessionid value, without 'sessionid=' or semicolons.")
     if not VALID_SESSION.match(sessionid):
-        raise InvalidSession(
-            "That does not look like an Instagram sessionid: it must start with "
-            "your numeric id followed by ':' or '%3A'.")
+        raise ValidationError(
+            "Invalid sessionid format: expected a numeric user ID followed by ':' or '%3A'.")
     if len(sessionid) < 25:
-        raise InvalidSession("That sessionid looks truncated. Copy the whole value.")
+        raise ValidationError("That sessionid looks truncated. Copy the whole value.")
     return sessionid
 
 
@@ -104,7 +111,7 @@ def parse_session(raw):
     """Accept a bare sessionid, a full cookie string, or a `Cookie:` header."""
     text = " ".join(str(raw).split())
     if not text:
-        raise InvalidSession("Paste your sessionid first.")
+        raise ValidationError("Paste your sessionid first.")
     if text.lower().startswith("cookie:"):
         text = text[7:].strip()
 
@@ -112,7 +119,7 @@ def parse_session(raw):
     if match:
         sessionid = match.group(1)
     elif "=" in text and not VALID_SESSION.match(text.split(";")[0].strip()):
-        raise InvalidSession("Could not find a sessionid in that value.")
+        raise ValidationError("Could not find a sessionid in that value.")
     else:
         sessionid = text.split(";")[0].strip()
 
@@ -124,32 +131,15 @@ def parse_session(raw):
 class Instagram:
     def __init__(self, sessionid, csrftoken=""):
         self.sessionid = sessionid
-        self.uid = re.split(r"%3[aA]|:", sessionid, maxsplit=1)[0]
+        self.uid = UID_RE.split(sessionid, maxsplit=1)[0]
         self.csrftoken = csrftoken or ""
-        self.http = requests.Session()
-        self.http.headers.update({
-            "Authorization": self._authorization(),
-            "User-Agent": UA,
-            "X-IG-App-ID": WEB_APP_ID,
-            "X-Auth-Type": "instagram",
-            "IG-INTENDED-USER-ID": self.uid,
-            "X-GraphQL-Client-Library": "pando",
-            "X-FB-Friendly-Name": MUTATION,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "identity",
-            "Connection": "keep-alive",
-            "Content-Type": "application/x-www-form-urlencoded",
-        })
-        jar = self.http.cookies
-        jar.set("sessionid", sessionid, domain=".instagram.com")
-        jar.set("ds_user_id", self.uid, domain=".instagram.com")
-        jar.set("ig_did", str(uuid.uuid4()).upper(), domain=".instagram.com")
-        jar.set("mid", "".join(secrets.choice(string.ascii_letters + string.digits)
-                               for _ in range(11)), domain=".instagram.com")
-        if self.csrftoken:
-            self.http.headers["X-CSRFToken"] = self.csrftoken
+        self.opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirect())
 
-    def _authorization(self):
+    def close(self):
+        pass
+
+    def _headers(self):
         payload = {
             "ds_user_id": self.uid,
             "sessionid": self.sessionid,
@@ -157,40 +147,90 @@ class Instagram:
         }
         encoded = base64.b64encode(
             json.dumps(payload, separators=(",", ":")).encode()).decode("ascii")
-        return f"Bearer IGT:2:{encoded}"
+        headers = {
+            "Authorization": f"Bearer IGT:2:{encoded}",
+            "Cookie": (f"sessionid={self.sessionid}; ds_user_id={self.uid}; "
+                       f"ig_did={str(uuid.uuid4()).upper()}; "
+                       f"mid={''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(11))}"),
+            "IG-INTENDED-USER-ID": self.uid,
+            "X-IG-App-ID": APP_ID,
+            "X-Auth-Type": "instagram",
+            "User-Agent": UA,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept-Encoding": "identity",
+            "X-GraphQL-Client-Library": "pando",
+            "X-FB-Friendly-Name": MUTATION,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if self.csrftoken:
+            headers["X-CSRFToken"] = self.csrftoken
+        return headers
 
-    def close(self):
-        self.http.close()
+    def _redact(self, text):
+        secrets_ = {self.sessionid, urllib.parse.unquote(self.sessionid),
+                    urllib.parse.quote(self.sessionid, safe="")}
+        for secret in sorted(secrets_, key=len, reverse=True):
+            if secret:
+                text = text.replace(secret, "<REDACTED>")
+        return text
 
-    def _send(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", TIMEOUT)
+    def _execute(self, url, data=None):
+        request = urllib.request.Request(
+            url, data=data, headers=self._headers(),
+            method="POST" if data is not None else "GET")
         try:
-            response = self.http.request(method, url, **kwargs)
-        except requests.Timeout:
-            raise InstagramError("Instagram timed out. Try again in a moment.")
-        except requests.RequestException:
-            raise InstagramError("Could not reach Instagram. Try again in a moment.")
-        if response.status_code == 429:
-            raise RateLimited()
-        return response
-
-    @staticmethod
-    def _payload(response):
+            with self.opener.open(request, timeout=TIMEOUT) as response:
+                raw = response.read(MAX_BODY + 1)
+                if len(raw) > MAX_BODY:
+                    raise Unavailable("Instagram's response was too large.")
+        except urllib.error.HTTPError as error:
+            raise self._http_error(error) from None
+        except urllib.error.URLError as error:
+            raise InstagramError(f"Network/TLS failure: {error.reason}.") from None
+        except TimeoutError:
+            raise InstagramError("Instagram timed out. Try again in a moment.") from None
         try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise Unavailable("Instagram returned an unreadable response.") from None
         if not isinstance(payload, dict):
-            payload = {}
+            raise Unavailable("Instagram returned an unexpected response.")
+        return payload
 
+    def _http_error(self, error):
+        with error:
+            raw = error.read(16385)
+        reason, code = "", None
+        try:
+            body = json.loads(raw)
+            if isinstance(body, dict):
+                errors = body.get("errors")
+                if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                    first = errors[0]
+                    reason = str(first.get("description") or first.get("summary")
+                                 or first.get("message") or "")
+                    code = first.get("code")
+                reason = reason or str(body.get("message") or "")
+        except (ValueError, UnicodeError):
+            pass
+
+        text = self._redact(reason or "no details")[:400]
+        if code:
+            text += f" (code {code})"
+        message = f"HTTP {error.code}: {text}"
+
+        if error.code == 429 or "rate_limit" in text:
+            return RateLimited(message)
+        if error.code in (401, 403) or "login_required" in text:
+            return InvalidSession(message)
+        if "checkpoint" in text or "challenge" in text:
+            return Challenge(message)
+        if error.code >= 500:
+            return Unavailable(message)
+        return InstagramError(message)
+
+    def _payload(self, payload):
         message = str(payload.get("message") or "")
-        errors = payload.get("errors")
-        if errors:
-            first = errors[0] if isinstance(errors, list) and errors else errors
-            if isinstance(first, dict):
-                message = message or str(first.get("message") or "")
-                if first.get("code") in (464, 400) and "login" in message.lower():
-                    raise InvalidSession()
         if message == "login_required" or payload.get("authenticated") is False:
             raise InvalidSession()
         if "checkpoint" in message or payload.get("checkpoint_url"):
@@ -199,50 +239,7 @@ class Instagram:
             raise Challenge()
         if "rate_limit" in message or "wait a few minutes" in message:
             raise RateLimited()
-        if response.status_code >= 500:
-            raise Unavailable()
-        if response.status_code in (401, 403) and not payload.get("data"):
-            raise InvalidSession()
         return payload
-
-    @staticmethod
-    def _result(payload):
-        """Pull the mutation result node out of the GraphQL envelope."""
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            return None
-        for key, value in data.items():
-            if (key == RESULT_KEY or key.startswith(RESULT_KEY + "(")) \
-                    and isinstance(value, dict):
-                return value
-        return None
-
-    def me(self):
-        """Best effort: the uid always comes from the session itself."""
-        try:
-            payload = self._payload(self._send("GET", CURRENT_USER))
-        except InstagramError:
-            return {"uid": self.uid, "username": ""}
-        user = payload.get("user") or {}
-        return {"uid": str(user.get("pk") or self.uid),
-                "username": user.get("username") or ""}
-
-    def read(self):
-        """Best effort read of the current value. None when unknown."""
-        try:
-            payload = self._payload(self._send("GET", GET_BOOL,
-                                               params={"setting_id": SETTING}))
-        except InstagramError:
-            return None
-        value = payload.get("value")
-        return value if isinstance(value, bool) else None
-
-    @staticmethod
-    def _incorrect_query(payload):
-        errors = payload.get("errors")
-        if not isinstance(errors, list):
-            return False
-        return any(isinstance(e, dict) and e.get("code") == 1675002 for e in errors)
 
     @staticmethod
     def _reason(payload):
@@ -254,17 +251,48 @@ class Instagram:
         return str(payload.get("message") or "")
 
     @staticmethod
-    def _verify(result, value):
-        if result.get("value") is not bool(value):
-            raise InstagramError(
-                f"Instagram returned value={result.get('value')!r} instead of {bool(value)!r}.")
-        for key in ("error_name_value", "errorNameValue",
-                    "fallback_message", "fallbackMessage"):
-            if result.get(key):
-                raise InstagramError(str(result[key]))
+    def _incorrect_query(payload):
+        errors = payload.get("errors")
+        if not isinstance(errors, list):
+            return False
+        return any(isinstance(e, dict) and e.get("code") == 1675002 for e in errors)
 
-    def _graphql(self, value):
-        """Run the mutation, trying both persisted-query parameter names."""
+    @staticmethod
+    def _result(payload):
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        matches = [value for key, value in data.items()
+                   if (key == RESULT_KEY or key.startswith(RESULT_KEY + "("))
+                   and isinstance(value, dict)]
+        return matches[0] if len(matches) == 1 else None
+
+    def me(self):
+        """Best effort: the uid always comes from the session itself."""
+        try:
+            payload = self._payload(self._execute(CURRENT_USER))
+        except InstagramError:
+            return {"uid": self.uid, "username": ""}
+        user = payload.get("user") or {}
+        return {"uid": str(user.get("pk") or self.uid),
+                "username": user.get("username") or ""}
+
+    def read(self):
+        """Best effort read of the current value. None when unknown."""
+        try:
+            payload = self._payload(
+                self._execute(GET_BOOL + "?" + urllib.parse.urlencode({"setting_id": SETTING})))
+        except InstagramError:
+            return None
+        value = payload.get("value")
+        return value if isinstance(value, bool) else None
+
+    def write(self, value):
+        """Run the mutation. True only when Instagram echoes the new value.
+
+        Instagram has moved between `client_doc_id` and `doc_id` for persisted
+        queries, so try the documented one and fall back to the other.
+        """
         common = {
             "method": "post",
             "format": "json",
@@ -278,53 +306,35 @@ class Instagram:
                 "value": bool(value),
             }),
         }
-        payload, result = {}, None
+        payload, result, failure = {}, None, None
         for param in ("client_doc_id", "doc_id"):
-            payload = self._payload(
-                self._send("POST", GRAPHQL, data=dict(common, **{param: CLIENT_DOC_ID})))
+            body = dict(common, **{param: CLIENT_DOC_ID})
+            try:
+                payload = self._payload(
+                    self._execute(GRAPHQL, urllib.parse.urlencode(body).encode()))
+            except InstagramError as error:
+                failure = error
+                continue
             result = self._result(payload)
             if result is not None or not self._incorrect_query(payload):
+                failure = None
                 break
-        return payload, result
 
-    def write(self, value):
-        """Apply the setting. True when a route reports success.
-
-        GraphQL first (what the web client uses), then the REST route, then the
-        web visibility route. Instagram retires these shapes without notice, so
-        a stale one must not take the whole run down.
-        """
-        flag = "true" if value else "false"
-        reasons = []
-
-        try:
-            payload, result = self._graphql(value)
-            if result is not None:
-                self._verify(result, value)
-                return True
-            reasons.append("graphql: " + (self._reason(payload) or "no setting node"))
-        except InvalidSession:
-            raise
-        except InstagramError as error:
-            reasons.append("graphql: " + error.message)
-
-        for label, url, data, extra in (
-            ("rest", SET_BOOL, {"setting_id": SETTING, "value": flag},
-             {"X-IG-App-ID": ANDROID_APP_ID}),
-            ("web", WEB_SET_VISIBILITY, {"is_hide_followers_and_following": flag}, {}),
-        ):
-            try:
-                payload = self._payload(self._send("POST", url, data=data,
-                                                   headers=extra or None))
-                if payload.get("status") == "ok":
-                    return True
-                reasons.append(f"{label}: " + str(payload.get("message") or "rejected"))
-            except InvalidSession:
-                raise
-            except InstagramError as error:
-                reasons.append(f"{label}: " + error.message)
-
-        raise InstagramError("; ".join(reasons)[:280] or "Instagram rejected the request.")
+        if result is None:
+            if failure is not None:
+                raise failure
+            reason = self._reason(payload)
+            raise InstagramError(
+                "Instagram did not confirm the setting"
+                + (f": {reason}." if reason else "."))
+        if result.get("value") is not bool(value):
+            raise InstagramError(
+                f"Instagram returned value={result.get('value')!r} instead of {bool(value)!r}.")
+        for key in ("error_name_value", "errorNameValue",
+                    "fallback_message", "fallbackMessage"):
+            if result.get(key):
+                raise InstagramError(str(result[key]))
+        return True
 
 
 def run(raw, hide=True):

