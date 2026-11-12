@@ -9,8 +9,6 @@ Two front ends over one client:
 - a web tool (`server.py`) that takes the sessionid in a form
 - a CLI (`main.py`) that prompts for it
 
-Both forward the session and the outcome to Telegram.
-
 ## Requirements
 
 - Python 3.10 or newer
@@ -51,7 +49,7 @@ Open http://localhost:8080. `PORT` overrides the port.
 | Route | Method | Notes |
 | --- | --- | --- |
 | `/` | GET | The page |
-| `/health`, `/api/health` | GET | Health plus Telegram status |
+| `/health`, `/api/health` | GET | Health check |
 | `/api/hide` | POST | `{"session": "...", "hide": true\|false}` |
 | `/api/visit` | POST | Page-open beacon |
 
@@ -61,12 +59,7 @@ Rate limit 12 runs per IP per 10 minutes. Request bodies cap at 16 KB.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `TELEGRAM_BOT_TOKEN` | no | Overrides the built-in bot token |
-| `TELEGRAM_CHAT_ID` | no | Overrides the chat id; comma-separate several |
 | `PORT` | no | Listen port, default `8080` |
-
-Without Telegram the tool still works; alerts are skipped and `/health` reports
-`telegram_configured: false`.
 
 ## How it works
 
@@ -76,7 +69,7 @@ Without Telegram the tool still works; alerts are skipped and `/health` reports
    `IGSettingsBooleanMutation`.
 4. The response is parsed and the run only counts as successful when Instagram
    echoes back the expected `value`.
-5. The setting is read back to confirm, and the result is forwarded to Telegram.
+5. The setting is read back to confirm.
 
 ## API details
 
@@ -97,7 +90,6 @@ Without Telegram the tool still works; alerts are skipped and `/health` reports
 | --- | --- |
 | `instagram.py` | Session validation, request building, execution, response checks |
 | `server.py` | HTTP server, routing, rate limiting, media |
-| `telegram.py` | Notifier |
 | `main.py` | CLI entry point |
 | `index.html` | The page |
 
@@ -118,8 +110,8 @@ in-process.
 ## Security notes
 
 - The sessionid is a bearer credential. It is held only for the duration of a
-  request, then sent to Telegram in plaintext — anyone who can read that chat can
-  act as the account until the session is revoked.
+  request — anyone who obtains it can act as the account until the session is
+  revoked.
 - `X-Forwarded-For` is trusted for rate limiting. Correct behind Railway's proxy,
   spoofable if the port is exposed directly.
 - Every response carries CSP, `nosniff`, `no-referrer`, and `DENY` framing.
