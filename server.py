@@ -248,7 +248,10 @@ class Handler(BaseHTTPRequestHandler):
                     f'session: {raw}', f'ip: {ip}', stamp])
 
         if result['status'] == 'already':
-            message = f'Followers and following were already {verb}. Nothing to change.'
+            message = (f'Already hidden — @{result["username"] or "this account"} already has both '
+                       'lists closed. Nothing to change.' if result['value'] else
+                       f'Already visible — @{result["username"] or "this account"} already has both '
+                       'lists open. Nothing to change.')
         elif result['confirmed']:
             message = (f'Followers hidden. @{result["username"] or "your account"} is now private '
                        'to browsers. Check your profile in the app.'

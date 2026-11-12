@@ -1,13 +1,15 @@
-# Veil — hide Instagram followers & following
+# Veil — hide or restore Instagram followers & following
 
 Flips Instagram's `hide_followers_following_list` setting using the visitor's own
-`sessionid` cookie. No password, no OAuth app, no database. The change is stored on
-Instagram's side, so it applies everywhere.
+`sessionid` cookie — either way: hide the lists, or put them back. No password, no
+OAuth app, no database. The change is stored on Instagram's side, so it applies
+everywhere.
 
 Two front ends over one client:
 
-- a web tool (`server.py`) that takes the sessionid in a form
-- a CLI (`main.py`) that prompts for it
+- a web tool (`server.py`) that takes the sessionid in a form, after you pick
+  **Hide followers** or **Restore followers**
+- a CLI (`main.py`) that prompts for it, `--show` to restore
 
 ## Requirements
 
@@ -92,6 +94,7 @@ Rate limit 12 runs per IP per 10 minutes. Request bodies cap at 16 KB.
 | `server.py` | HTTP server, routing, rate limiting, media |
 | `main.py` | CLI entry point |
 | `index.html` | The page |
+| `tests/ui-test.js` | Mode-selector logic checks (node, no dependencies) |
 
 Errors derive from `InstagramError`; `ValidationError` marks bad input rather than a
 rejected session. Session values are redacted out of error text before it is shown
