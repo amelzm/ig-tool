@@ -5,7 +5,7 @@ import telegram
 
 
 def run_demo():
-    return {"mode": "demo", "parse": instagram.mask("1234567890%3Aabcdefghijklmnopqrstuvwxyz"),
+    return {"mode": "check", "parse": instagram.mask("1234567890%3Aabcdefghijklmnopqrstuvwxyz"),
             "telegram_configured": telegram.configured(),
             "message": "Local check only. No external service was contacted."}
 
